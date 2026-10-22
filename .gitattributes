@@ -1,0 +1,5 @@
+# 统一用 LF 入库；Windows 上 .bat 保持 CRLF，双击才能正常执行
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
+*.tar.gz binary

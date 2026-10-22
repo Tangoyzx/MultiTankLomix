@@ -1,0 +1,10 @@
+node_modules/
+dist/
+multitank-dist.tar.gz
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+AIWorkSpace/
