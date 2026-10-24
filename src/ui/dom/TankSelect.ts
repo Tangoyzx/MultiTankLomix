@@ -1,5 +1,5 @@
 import type { TankTypeConfig } from '../../config.js';
-import { PLAYER_IDS, playerLabel } from '../../core/types.js';
+import { PLAYER_IDS, playerLabel, sideLabel } from '../../core/types.js';
 import type { PlayerId } from '../../core/types.js';
 import { allTankTypes, DEFAULT_TANK_ID } from '../../game/TankTypes.js';
 import { tankColors } from '../../render/palette.js';
@@ -19,8 +19,12 @@ export class TankSelect {
   readonly root: HTMLElement;
   private picks: TankPicks = { left: DEFAULT_TANK_ID, right: DEFAULT_TANK_ID };
   private lockedSeat: PlayerId | null = null;
+  private seat: PlayerId | null = null;
+  private waiting = false;
   private readonly nextButton: HTMLButtonElement;
+  private readonly tipLine: HTMLElement;
   private readonly panels = new Map<PlayerId, HTMLElement>();
+  private readonly titles = new Map<PlayerId, HTMLElement>();
   private readonly handlers: TankSelectHandlers;
 
   constructor(handlers: TankSelectHandlers) {
@@ -28,7 +32,7 @@ export class TankSelect {
     this.root = el('div', 'screen select');
 
     const title = el('h2', 'screen-title', '选择坦克');
-    const tip = el('p', 'screen-tip', '两名玩家各自选择一款坦克，选好后点“下一步”');
+    this.tipLine = el('p', 'screen-tip', '两名玩家各自选择一款坦克，选好后点“下一步”');
     const panels = el('div', 'select-panels');
     for (const id of PLAYER_IDS) {
       panels.appendChild(this.buildPanel(id));
@@ -40,7 +44,7 @@ export class TankSelect {
     this.nextButton.classList.add('next-button');
     actions.appendChild(this.nextButton);
 
-    this.root.append(title, tip, panels, actions);
+    this.root.append(title, this.tipLine, panels, actions);
     this.refresh();
   }
 
@@ -48,7 +52,9 @@ export class TankSelect {
     const panel = el('div', `panel panel-${playerId}`);
     const colors = tankColors(playerId);
     panel.style.setProperty('--panel-color', colors.body);
-    panel.appendChild(el('h3', 'panel-title', playerLabel(playerId)));
+    const heading = el('h3', 'panel-title', playerLabel(playerId));
+    this.titles.set(playerId, heading);
+    panel.appendChild(heading);
 
     const cards = el('div', 'cards');
     for (const type of allTankTypes()) {
@@ -107,6 +113,34 @@ export class TankSelect {
     this.refresh();
   }
 
+  /** 远端模式：标明哪个席位是自己，对手面板只读。 */
+  setSeatLabels(seat: PlayerId | null): void {
+    this.seat = seat;
+    for (const [playerId, heading] of this.titles) {
+      if (!seat) {
+        heading.textContent = playerLabel(playerId);
+        continue;
+      }
+      heading.textContent =
+        playerId === seat ? `你（${sideLabel(playerId)}方）` : `对手（${sideLabel(playerId)}方）`;
+    }
+    this.updateTip();
+    this.refresh();
+  }
+
+  /** 已上报就绪，等待对手也点“下一步”。 */
+  setWaiting(waiting: boolean): void {
+    this.waiting = waiting;
+    this.updateTip();
+    this.refresh();
+  }
+
+  /** 重连后按服务端记录补齐双方选择。 */
+  applyPicks(picks: TankPicks): void {
+    this.picks = { ...picks };
+    this.refresh();
+  }
+
   setPick(playerId: PlayerId, tankId: string): void {
     if (this.picks[playerId] === tankId) return;
     this.picks = { ...this.picks, [playerId]: tankId };
@@ -127,7 +161,19 @@ export class TankSelect {
         card.classList.toggle('card-locked', locked);
       }
     }
-    this.nextButton.disabled = !PLAYER_IDS.every((id) => Boolean(this.picks[id]));
+    const ready = PLAYER_IDS.every((id) => Boolean(this.picks[id]));
+    this.nextButton.disabled = !ready || this.waiting;
+    this.nextButton.textContent = this.waiting ? '等待对手…' : '下一步';
+  }
+
+  private updateTip(): void {
+    if (!this.seat) {
+      this.tipLine.textContent = '两名玩家各自选择一款坦克，选好后点“下一步”';
+      return;
+    }
+    this.tipLine.textContent = this.waiting
+      ? '已提交，等待对手确认后立即开战'
+      : `你操作${sideLabel(this.seat)}方坦克，选好后点“下一步”，对手选什么会在右侧同步显示`;
   }
 
   setVisible(visible: boolean): void {

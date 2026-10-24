@@ -6,8 +6,8 @@ import { InputGate } from '../input/InputGate.js';
 import { PointerInput } from '../input/PointerInput.js';
 import { BroadcastTransport } from '../net/BroadcastTransport.js';
 import { LocalTransport } from '../net/LocalTransport.js';
-import { RemoteTransport } from '../net/RemoteTransport.js';
-import type { GameCommand, Transport } from '../net/Transport.js';
+import { RemoteTransport, defaultEndpoint } from '../net/RemoteTransport.js';
+import type { GameCommand, OpponentLeftCommand, Transport, TransportStatus } from '../net/Transport.js';
 import { assertConfigMatch } from '../net/Transport.js';
 import { Camera } from '../render/Camera.js';
 import type { Box } from '../render/Camera.js';
@@ -15,18 +15,27 @@ import { Renderer } from '../render/Renderer.js';
 import { HudOverlay } from '../ui/dom/HudOverlay.js';
 import type { HudData, HudTankInfo } from '../ui/dom/HudOverlay.js';
 import { MainMenu } from '../ui/dom/MainMenu.js';
+import { MatchPanel } from '../ui/dom/MatchPanel.js';
 import { ResultDialog } from '../ui/dom/ResultDialog.js';
 import { TankSelect } from '../ui/dom/TankSelect.js';
 import type { TankPicks } from '../ui/dom/TankSelect.js';
-import { showToast } from '../ui/dom/dom.js';
+import { el, showToast, readUrlFlag } from '../ui/dom/dom.js';
+import {
+  fetchServerVersion,
+  formatVersion,
+  isOutdated,
+  readLocalVersion,
+} from '../net/versionCheck.js';
+import type { VersionInfo } from '../net/versionCheck.js';
 import { BattleState } from './BattleState.js';
 import type { MoveDir } from './MoveController.js';
 import { TurnController } from './TurnController.js';
 
-export type AppScreen = 'menu' | 'select' | 'battle' | 'result';
+export type AppScreen = 'menu' | 'matching' | 'select' | 'battle' | 'result';
 export type PlayMode = 'local' | 'remote';
 
-const REMOTE_ENDPOINT_PLACEHOLDER = 'wss://尚未接入';
+/** 断线重连等待期间 HUD 上显示的倒计时。 */
+const RECONNECT_HINT_SECONDS = 20;
 
 /**
  * 应用外壳：菜单 → 选坦 → 战斗 → 结算 的状态机，
@@ -42,6 +51,7 @@ export class GameApp {
   private readonly pointer: PointerInput;
   private readonly hud: HudOverlay;
   private readonly menu: MainMenu;
+  private readonly match: MatchPanel;
   private readonly select: TankSelect;
   private readonly dialog: ResultDialog;
 
@@ -55,9 +65,14 @@ export class GameApp {
 
   private mode: PlayMode = 'local';
   private seat: PlayerId = 'left';
+  private remoteSeed: number | null = null;
+  private reconnectSeconds = 0;
   private accumulator = 0;
   private lastTime = 0;
   private rafId = 0;
+  /** 本地加载的构建信息（页面 meta 注入），用来和服务端的版本清单比对。 */
+  private readonly localVersion: VersionInfo = readLocalVersion();
+  private updateBanner: HTMLElement | null = null;
 
   constructor(canvas: HTMLCanvasElement, uiRoot: HTMLElement) {
     const ctx = canvas.getContext('2d');
@@ -78,7 +93,14 @@ export class GameApp {
       onAimEnd: () => this.turn?.releaseAim(),
     });
 
-    this.menu = new MainMenu({ onLocal: () => this.openSelect() });
+    this.menu = new MainMenu(
+      { onLocal: () => this.startLocal(), onRemote: () => this.startRemote() },
+      this.localVersionText(),
+    );
+    this.match = new MatchPanel({
+      onCancel: () => this.showMenu(),
+      version: this.localVersionText(),
+    });
     this.select = new TankSelect({
       onPickChange: (playerId, tankId) => this.sendPick(playerId, tankId),
       onConfirm: (picks) => this.confirmPicks(picks),
@@ -90,20 +112,24 @@ export class GameApp {
       onExit: () => this.showMenu(),
     });
 
-    uiRoot.append(this.menu.root, this.select.root, this.hud.root, this.dialog.root);
+    uiRoot.append(this.menu.root, this.match.root, this.select.root, this.hud.root, this.dialog.root);
     this.readUrlMode();
     this.hud.setVisible(false);
+    this.match.setVisible(false);
     this.select.setVisible(false);
     this.dialog.hide();
 
     this.resize();
     window.addEventListener('resize', this.resize);
     window.addEventListener('orientationchange', this.resize);
+    this.watchVersion();
   }
 
   start(): void {
-    this.screen = 'menu';
-    this.gate.setUiBlocked(true);
+    if (this.mode !== 'remote') {
+      this.screen = 'menu';
+      this.gate.setUiBlocked(true);
+    }
     this.lastTime = performance.now();
     this.rafId = requestAnimationFrame(this.frame);
   }
@@ -114,6 +140,52 @@ export class GameApp {
     this.seat = params.get('seat') === 'right' ? 'right' : 'left';
   }
 
+  /** 页脚本地版本：构建注入的 meta，拿不到时退回 URL 上的 ?v=。 */
+  private localVersionText(): string {
+    return formatVersion(this.localVersion) || readUrlFlag(window.location.search, 'v') || 'dev';
+  }
+
+  /**
+   * 版本自检：启动时查一次，之后每次回到前台 / 回到主界面再查一次。
+   * 服务端换了构建就弹一条可点的刷新提示，玩家点一下即拿最新资源。
+   */
+  private watchVersion(): void {
+    void this.checkVersion();
+    document.addEventListener?.('visibilitychange', () => {
+      if (document.visibilityState !== 'hidden') void this.checkVersion();
+    });
+  }
+
+  private async checkVersion(): Promise<void> {
+    const payload = await fetchServerVersion();
+    if (payload) this.applyServerVersion(payload);
+  }
+
+  private applyServerVersion(payload: Partial<VersionInfo>): void {
+    // 页脚一律显示服务端正在部署的版本，本地落后时下面再叠刷新提示。
+    const text = formatVersion(payload) || this.localVersionText();
+    if (text) {
+      this.match.setVersion(text);
+      this.menu.setVersion(text);
+    }
+    if (isOutdated(this.localVersion, payload)) this.showUpdateBanner(payload);
+  }
+
+  private showUpdateBanner(payload: Partial<VersionInfo>): void {
+    if (this.updateBanner) return;
+    const label = formatVersion(payload) || '新版本';
+    const banner = el('div', 'update-banner', `发现新版本 ${label}，点此刷新`);
+    banner.setAttribute('role', 'button');
+    banner.addEventListener('click', () => this.reloadFresh());
+    this.uiRoot.appendChild(banner);
+    this.updateBanner = banner;
+  }
+
+  /** 入口本身是 no-store，刷新即回源；新页面里的资源查询串也换成了新指纹。 */
+  private reloadFresh(): void {
+    window.location?.reload?.();
+  }
+
   private createTransport(): Transport {
     const params = new URLSearchParams(window.location.search);
     if (this.mode === 'local') return new LocalTransport();
@@ -121,34 +193,92 @@ export class GameApp {
     if (net === 'broadcast') {
       return new BroadcastTransport(params.get('room') ?? 'default');
     }
-    return new RemoteTransport(REMOTE_ENDPOINT_PLACEHOLDER);
+    return new RemoteTransport(readUrlFlag(window.location.search, 'server') ?? defaultEndpoint());
   }
 
-  private openSelect(): void {
+  private openSelect(options: { reuseTransport?: boolean } = {}): void {
     this.screen = 'select';
     this.gate.setUiBlocked(true);
     this.menu.setVisible(false);
+    this.match.setVisible(false);
     this.hud.setVisible(false);
     this.select.setVisible(true);
     this.select.setLockedSeat(this.mode === 'remote' ? otherPlayer(this.seat) : null);
+    this.select.setSeatLabels(this.mode === 'remote' ? this.seat : null);
+    this.select.setWaiting(false);
+
+    if (options.reuseTransport && this.transport) return;
 
     this.transport?.close();
     this.transport = this.createTransport();
+    this.transport.events.on('status', (status) => this.onTransportStatus(status));
     if (this.mode === 'remote') {
       this.transport.events.on('command', (command) => this.onRemoteCommand(command));
-      try {
-        this.transport.connect();
-        this.transport.send({
-          type: 'handshake',
-          playerId: this.seat,
-          configHash: gameplayConfigHash(),
-        });
-      } catch (error) {
-        showToast(this.uiRoot, error instanceof Error ? error.message : '远端连接失败');
-        this.showMenu();
-      }
-    } else {
-      this.transport.connect();
+    }
+    this.transport.connect();
+  }
+
+  /** 本地双人：两端席位都在这一台设备上，不走网络。从远端返回后也要切回本地模式。 */
+  startLocal(): void {
+    this.mode = 'local';
+    this.seat = 'left';
+    this.disposeBattle();
+    this.transport?.close();
+    this.transport = null;
+    this.remoteSeed = null;
+    this.openSelect();
+  }
+
+  /** 远端：进入快速匹配队列，两端都连上同一台服务器即可自动配对。 */
+  startRemote(): void {
+    this.mode = 'remote';
+    this.disposeBattle();
+    this.transport?.close();
+    this.transport = null;
+    this.remoteSeed = null;
+    this.reconnectSeconds = 0;
+
+    const params = new URLSearchParams(window.location.search);
+    // 调试用：同一浏览器两个标签页直接对联（?net=broadcast&room=xxx&seat=left/right），
+    // 不经过服务器匹配，方便离线验证“自己回合操作 / 对手回合锁输入并回放”。
+    if ((params.get('net') ?? 'remote') === 'broadcast') {
+      this.seat = params.get('seat') === 'right' ? 'right' : 'left';
+      this.attachTransport(new BroadcastTransport(params.get('room') ?? 'default'));
+      this.openSelect({ reuseTransport: true });
+      return;
+    }
+
+    this.screen = 'matching';
+    this.gate.setUiBlocked(true);
+    this.menu.setVisible(false);
+    this.select.setVisible(false);
+    this.hud.setVisible(false);
+    this.dialog.hide();
+    this.match.setVisible(true);
+    this.match.setStatus('connecting', '正在连接服务器…');
+
+    // 连上服务器后由传输层自动发 handshake + join，服务端凑够两人就下发 matched。
+    this.attachTransport(new RemoteTransport(readUrlFlag(window.location.search, 'server') ?? defaultEndpoint()));
+  }
+
+  /** 绑定一条传输：状态与命令都进同一套处理，远端专用的回放逻辑只接一次。 */
+  private attachTransport(transport: Transport): void {
+    this.transport = transport;
+    transport.events.on('status', (status) => this.onTransportStatus(status));
+    transport.events.on('command', (command) => this.onRemoteCommand(command));
+    transport.connect();
+  }
+
+  private onTransportStatus(status: TransportStatus): void {
+    if (this.screen === 'matching') {
+      if (status.state === 'open') this.match.setStatus('waiting', '已连接，正在等待对手…');
+      else if (status.state === 'connecting') this.match.setStatus('connecting', status.detail);
+      else if (status.state === 'error') this.match.setStatus('error', status.detail);
+    }
+    // 连上服务器时顺手对一次版本：连上了说明服务器在，版本清单也一定拿得到。
+    if (status.state === 'open') void this.checkVersion();
+    if (status.state === 'error' && this.screen === 'battle') {
+      showToast(this.uiRoot, status.detail);
     }
   }
 
@@ -161,7 +291,11 @@ export class GameApp {
   private confirmPicks(picks: TankPicks): void {
     const seed = this.urlSeed() ?? randomSeed();
     if (this.mode === 'remote' && this.transport) {
-      this.transport.send({ type: 'start', seed, picks });
+      // 远端不各自开局：只上报“我已就绪”，由服务端确认双方就绪后广播 start，
+      // 否则两端会各发一份 start，种子与坦克都可能不一致。
+      this.transport.send({ type: 'ready', playerId: this.seat, picks });
+      if (this.screen === 'select') this.select.setWaiting(true);
+      return;
     }
     this.startBattle(seed, picks);
   }
@@ -181,6 +315,7 @@ export class GameApp {
     this.lastImpact = null;
     this.resultTimer = -1;
     this.pendingWinner = null;
+    this.reconnectSeconds = 0;
     this.wireTurn();
     this.turn.start();
     this.syncRemoteLock();
@@ -214,6 +349,9 @@ export class GameApp {
     turn.events.on('impact', ({ hit }) => {
       this.lastImpact = { x: hit.point.x, y: hit.point.y };
     });
+    turn.events.on('turnEnd', (snapshot) => {
+      this.transport?.send({ type: 'sync', ...snapshot });
+    });
     turn.events.on('gameOver', ({ winner }) => {
       this.pendingWinner = winner;
       this.resultTimer = CONFIG.ui.resultDelaySeconds;
@@ -231,6 +369,26 @@ export class GameApp {
           this.showMenu();
         }
         break;
+      case 'matched':
+        // 已经在打的对局不接受新的配对（例如重连时房间已被回收）。
+        if (this.screen !== 'matching') break;
+        this.seat = command.seat;
+        this.remoteSeed = command.seed;
+        this.match.setStatus('matched', `已匹配到对手，你是${this.seat === 'left' ? '左方（先手）' : '右方'}`);
+        this.openSelect({ reuseTransport: true });
+        break;
+      case 'resumed':
+        this.seat = command.seat;
+        this.remoteSeed = command.seed;
+        this.reconnectSeconds = 0;
+        if (command.phase === 'battle' && this.state) {
+          this.select.applyPicks(command.picks);
+          showToast(this.uiRoot, '已回到对局');
+        }
+        break;
+      case 'helloAck':
+        this.applyServerVersion({ version: command.serverVersion, build: command.serverBuild });
+        break;
       case 'move':
         this.turn?.applyRemoteMove(command.dir, command.distance);
         break;
@@ -238,7 +396,7 @@ export class GameApp {
         this.turn?.applyRemoteShot(command.angleDeg, command.power, command.dirSign);
         break;
       case 'start':
-        if (this.screen === 'select') {
+        if (this.screen === 'select' || this.screen === 'matching') {
           // 对方的选择以对方发来的为准，自己的席位用本地选择，保证两边一致。
           const merged: TankPicks = { ...command.picks, [this.seat]: this.select.getPicks()[this.seat] };
           this.startBattle(command.seed, merged);
@@ -247,9 +405,46 @@ export class GameApp {
       case 'pick':
         this.select.setPick(command.playerId, command.tankId);
         break;
+      case 'sync':
+        this.turn?.applySync(command);
+        break;
+      case 'opponentReady':
+        if (this.screen === 'select') showToast(this.uiRoot, '对手已就绪，等待开局…', 1200);
+        break;
+      case 'opponentLeft':
+        this.onOpponentLeft(command);
+        break;
+      case 'opponentReconnected':
+        this.reconnectSeconds = 0;
+        showToast(this.uiRoot, '对手已重连，继续对局');
+        break;
+      case 'error':
+        showToast(this.uiRoot, command.message || '远端连接失败');
+        this.showMenu();
+        break;
+      case 'queued':
+        if (this.screen === 'matching') this.match.setStatus('waiting', '排队中，等待另一个玩家加入…');
+        break;
       default:
         break;
     }
+  }
+
+  /** 对手掉线：宽限期内等他重连，超时才算本局结束。 */
+  private onOpponentLeft(command: OpponentLeftCommand): void {
+    this.reconnectSeconds = command.reconnecting ? command.graceSeconds || RECONNECT_HINT_SECONDS : 0;
+    if (command.reconnecting) {
+      showToast(this.uiRoot, command.duringBattle ? '对手掉线，等待重连…' : '对手掉线，正在等待他回来…');
+      return;
+    }
+    if (command.duringBattle && this.state) {
+      this.pendingWinner = this.seat;
+      this.resultTimer = 0.1;
+      showToast(this.uiRoot, '对手已离开，本局判你胜利');
+      return;
+    }
+    showToast(this.uiRoot, '对手已离开，返回主界面');
+    if (this.screen === 'matching' || this.screen === 'select') this.showMenu();
   }
 
   private onMove(dir: MoveDir): void {
@@ -266,11 +461,15 @@ export class GameApp {
     this.screen = 'menu';
     this.gate.setUiBlocked(true);
     this.menu.setVisible(true);
+    this.match.setVisible(false);
     this.select.setVisible(false);
     this.hud.setVisible(false);
     this.dialog.hide();
+    this.remoteSeed = null;
+    this.reconnectSeconds = 0;
     this.transport?.close();
     this.transport = null;
+    void this.checkVersion();
   }
 
   private disposeBattle(): void {
@@ -350,6 +549,9 @@ export class GameApp {
       this.stepSim(step);
       this.accumulator -= step;
       steps++;
+    }
+    if (this.reconnectSeconds > 0) {
+      this.reconnectSeconds = Math.max(0, this.reconnectSeconds - dt);
     }
     if (steps === CONFIG.sim.maxCatchUpSteps) this.accumulator = 0;
 
@@ -468,10 +670,15 @@ export class GameApp {
     };
   }
   private hintText(turn: TurnController): string {
+    if (this.reconnectSeconds > 0) {
+      return `对手掉线，等待重连（${Math.ceil(this.reconnectSeconds)} 秒）…`;
+    }
     if (turn.inputLocked) return '对方回合，正在接收对方操作…';
     switch (turn.phase) {
       case 'move':
-        return '左右按钮移动；按住自己的坦克向反方向拖拽进入射击';
+        return this.mode === 'remote'
+          ? '你的回合：左右按钮移动；按住自己的坦克向反方向拖拽进入射击'
+          : '左右按钮移动；按住自己的坦克向反方向拖拽进入射击';
       case 'aim':
         return '虚线是无风弹道预览，松手开火';
       case 'resolving':
@@ -491,8 +698,14 @@ export class GameApp {
     this.screen = 'result';
     this.gate.setUiBlocked(true);
     const survivorHp = Math.ceil(state.tanks[winner].hp);
+    const title =
+      this.mode === 'remote'
+        ? winner === this.seat
+          ? '你胜利了'
+          : '你输了'
+        : `${winner === 'left' ? '左边玩家' : '右边玩家'}胜利`;
     this.dialog.show(
-      `${winner === 'left' ? '左边玩家' : '右边玩家'}胜利`,
+      title,
       `共 ${state.turnCount} 回合 · 剩余生命 ${survivorHp}`,
     );
   }

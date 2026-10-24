@@ -22,6 +22,10 @@ export interface HandshakeCommand {
   type: 'handshake';
   playerId: PlayerId;
   configHash: string;
+  /** 构建版本号，服务端只记录与提示，不作为匹配条件。 */
+  version?: string;
+  /** 重连凭据：断线后带着它回原房间。 */
+  resumeToken?: string;
 }
 
 export interface PickCommand {
@@ -30,9 +34,90 @@ export interface PickCommand {
   tankId: string;
 }
 
+/** 请求进入快速匹配队列；服务端凑够两人就下发 matched。 */
+export interface JoinCommand {
+  type: 'join';
+}
+
 export interface StartCommand {
   type: 'start';
   seed: number;
+  picks: Record<PlayerId, string>;
+}
+
+/** 匹配成功：服务端分配的席位与对局种子。 */
+export interface MatchedCommand {
+  type: 'matched';
+  roomId: string;
+  seat: PlayerId;
+  seed: number;
+}
+
+/** 断线重连回到原房间。 */
+export interface ResumedCommand {
+  type: 'resumed';
+  roomId: string;
+  seat: PlayerId;
+  seed: number;
+  phase: string;
+  picks: Record<PlayerId, string>;
+}
+
+/** 每回合结束的状态摘要，用来校正两端漂移。 */
+export interface SyncCommand {
+  type: 'sync';
+  playerId: PlayerId;
+  hp: number;
+  x: number;
+  y: number;
+  rotation: number;
+  windLevel: number;
+}
+
+export interface OpponentLeftCommand {
+  type: 'opponentLeft';
+  duringBattle: boolean;
+  reconnecting: boolean;
+  graceSeconds: number;
+}
+
+export interface ErrorCommand {
+  type: 'error';
+  code: string;
+  message: string;
+}
+
+export interface QueuedCommand {
+  type: 'queued';
+  reason: string;
+}
+
+/** 服务端确认握手并下发重连凭据。 */
+export interface HelloAckCommand {
+  type: 'helloAck';
+  serverVersion: string;
+  /** 服务端当前部署的构建指纹，客户端拿它判断是不是该刷新了。 */
+  serverBuild?: string;
+  resumeToken: string;
+}
+
+/** 对手已确认出战。 */
+export interface OpponentReadyCommand {
+  type: 'opponentReady';
+}
+
+/** 对手重连成功。 */
+export interface OpponentReconnectedCommand {
+  type: 'opponentReconnected';
+}
+
+export interface LeaveCommand {
+  type: 'leave';
+}
+
+export interface ReadyCommand {
+  type: 'ready';
+  playerId: PlayerId;
   picks: Record<PlayerId, string>;
 }
 
@@ -41,7 +126,19 @@ export type GameCommand =
   | ShotCommand
   | HandshakeCommand
   | PickCommand
-  | StartCommand;
+  | StartCommand
+  | ReadyCommand
+  | MatchedCommand
+  | JoinCommand
+  | ResumedCommand
+  | SyncCommand
+  | OpponentLeftCommand
+  | ErrorCommand
+  | QueuedCommand
+  | HelloAckCommand
+  | OpponentReadyCommand
+  | OpponentReconnectedCommand
+  | LeaveCommand;
 
 export type TransportState = 'idle' | 'connecting' | 'open' | 'closed' | 'error';
 
@@ -67,13 +164,6 @@ export interface Transport {
   connect(): void;
   send(command: GameCommand): void;
   close(): void;
-}
-
-export class NotImplementedError extends Error {
-  constructor(message = '远端多人游玩暂未开放') {
-    super(message);
-    this.name = 'NotImplementedError';
-  }
 }
 
 export class ConfigMismatchError extends Error {

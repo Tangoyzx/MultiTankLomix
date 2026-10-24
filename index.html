@@ -7,6 +7,10 @@
       content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
     />
     <meta name="theme-color" content="#0e1420" />
+    <!-- 入口本身不缓存：每次打开都向服务端要最新页面，js/css 也会回源校验 -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <link rel="stylesheet" href="/src/styles.css" />
     <title>双人坦克大战</title>
   </head>

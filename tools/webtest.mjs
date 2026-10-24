@@ -1,7 +1,8 @@
 /**
- * 零依赖浏览器验收：直接通过 CDP 驱动 Chromium（Node 内置 WebSocket）。
+ * 零依赖浏览器验收：直接通过 CDP 驱动 Chromium（自己实现的 WebSocket 客户端）。
  * 覆盖主界面 → 选坦 → 移动 → 拖拽瞄准 → 发射结算 → 换手 → 胜利弹窗 → 返回主界面，
- * 以及远端模式下“对手回合屏蔽本地输入 + 回放对方指令”。
+ * 远端模式下“对手回合屏蔽本地输入 + 回放对方指令”，
+ * 以及两个独立页面经服务器快速匹配成局、跨页面同步操作的完整链路。
  *
  * 用法： node tools/webtest.mjs [--headful] [--port 4173]
  */
@@ -9,6 +10,8 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+
+import { connectWebSocket } from './rawWs.mjs';
 
 // 可用环境变量 CHROME_PATH 指定别的浏览器（不同机器 playwright 版本号不同）。
 const CHROME =
@@ -54,12 +57,25 @@ class Cdp {
     });
   }
 
+  /**
+   * 连上页面的调试端口。本机 Node 内置 WebSocket 握手连不上，
+   * 所以走自写的零依赖客户端，顺手包成浏览器那套 addEventListener 接口。
+   */
   static async attach(wsUrl) {
-    const ws = new WebSocket(wsUrl);
-    await new Promise((res, rej) => {
-      ws.addEventListener('open', res, { once: true });
-      ws.addEventListener('error', rej, { once: true });
+    const url = new URL(wsUrl);
+    const raw = await connectWebSocket({
+      host: url.hostname,
+      port: Number(url.port),
+      path: url.pathname + url.search,
     });
+    const ws = {
+      addEventListener(type, fn) {
+        if (type === 'message') raw.on('message', (text) => fn({ data: text }));
+        return ws;
+      },
+      send: (data) => raw.send(data),
+      close: () => raw.close(),
+    };
     const cdp = new Cdp(ws);
     cdp.consoleErrors = [];
     await cdp.send('Runtime.enable');
@@ -170,6 +186,19 @@ async function waitFor(fn, { timeout = 8000, interval = 100, label = '条件' } 
   }
 }
 
+/** 新开一个独立页面（独立上下文），返回连上的 CDP 会话。 */
+async function openPage() {
+  const target = await fetch(`http://127.0.0.1:${CDP_PORT}/json/new?about:blank`, { method: 'PUT' }).then((r) => r.json());
+  const cdp = await Cdp.attach(target.webSocketDebuggerUrl);
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: VIEWPORT.width,
+    height: VIEWPORT.height,
+    deviceScaleFactor: 2,
+    mobile: true,
+  });
+  return cdp;
+}
+
 /** 页面里的“瞄准求解器”：用与实弹同一套无风积分，搜出能命中对手的角度/力度。 */
 const AIMBOT = async function () {
   const app = window.__tankApp;
@@ -270,6 +299,8 @@ async function main() {
       '--no-first-run',
       '--no-default-browser-check',
       '--hide-scrollbars',
+      // 环境里配了代理，localhost 必须直连，否则连站点和 ws 都会被代理吞掉
+      '--no-proxy-server',
       `--remote-debugging-port=${CDP_PORT}`,
       `--user-data-dir=${profile}`,
       `--window-size=${VIEWPORT.width},${VIEWPORT.height}`,
@@ -291,14 +322,7 @@ async function main() {
   }
   if (!version) throw new Error('Chromium 未能在预期时间内启动');
 
-  const target = await fetch(`http://127.0.0.1:${CDP_PORT}/json/new?about:blank`, { method: 'PUT' }).then((r) => r.json());
-  const cdp = await Cdp.attach(target.webSocketDebuggerUrl);
-  await cdp.send('Emulation.setDeviceMetricsOverride', {
-    width: VIEWPORT.width,
-    height: VIEWPORT.height,
-    deviceScaleFactor: 2,
-    mobile: true,
-  });
+  const cdp = await openPage();
 
   try {
     await runScenarios(cdp);
@@ -328,9 +352,9 @@ async function runScenarios(cdp) {
   })()`);
   check('主界面可见', menu.visible === true);
   const localBtn = menu.buttons.find((b) => b.text.includes('本地双人'));
-  const remoteBtn = menu.buttons.find((b) => b.text.includes('远端多人'));
+  const remoteBtn = menu.buttons.find((b) => b.text.includes('远端对战'));
   check('本地双人按钮可点', localBtn && localBtn.disabled === false);
-  check('远端多人按钮置灰', remoteBtn && remoteBtn.disabled === true);
+  check('远端对战按钮已开放可点', remoteBtn && remoteBtn.disabled === false, remoteBtn?.text);
   await cdp.shot('01-menu');
 
   // 2. 选坦界面
@@ -463,13 +487,18 @@ async function runScenarios(cdp) {
   // 9. 远端模式：对手回合屏蔽本地输入，但能回放对方指令
   await cdp.goto(`http://127.0.0.1:${PORT}/?wind=0&mode=remote&seat=right&net=broadcast&room=autotest`);
   await waitFor(() => cdp.evaluate('!!window.__tankApp'), { label: '远端模式启动' });
-  await cdp.click('.menu .primary-button');
+  await cdp.click('.menu .remote-button');
   await waitFor(async () => (await cdp.evaluate(`document.querySelector('.select')?.classList.contains('hidden')`)) === false, {
     label: '远端进入选坦界面',
   });
   const lockedPanel = await cdp.evaluate(`document.querySelector('.panel-left').classList.contains('panel-locked')`);
   check('远端模式锁定对方席位的选择', lockedPanel === true);
+  await cdp.click('.panel-right .card[data-tank-id="scout"]');
   await cdp.click('.next-button');
+  // 同浏览器联调通道没有服务端，这里代发服务端的 start 指令
+  await cdp.evaluate(
+    `window.__tankApp.onRemoteCommand({ type: 'start', seed: 20251022, picks: { left: 'hammer', right: 'scout' } })`,
+  );
   await waitFor(async () => (await cdp.evaluate('window.__tankApp.screen')) === 'battle', { label: '远端进入战斗' });
   const r0 = await cdp.evalFn(snapshot);
   check('对手回合锁定本地输入', r0.locked === true && r0.active === 'left', `locked=${r0.locked} active=${r0.active}`);
@@ -491,6 +520,113 @@ async function runScenarios(cdp) {
   });
   check('回放对方的发射指令', true);
   await cdp.shot('12-remote-replay');
+
+  // 10. 真机远端双人：两个独立页面经服务器快速匹配成同一局
+  const p1 = await openPage();
+  const p2 = await openPage();
+  try {
+    await p1.goto(`http://127.0.0.1:${PORT}/?wind=0`);
+    await p2.goto(`http://127.0.0.1:${PORT}/?wind=0`);
+    await waitFor(() => p1.evaluate('!!window.__tankApp'), { label: '页面一启动' });
+    await waitFor(() => p2.evaluate('!!window.__tankApp'), { label: '页面二启动' });
+
+    await p1.click('.menu .remote-button');
+    await waitFor(async () => (await p1.evaluate('window.__tankApp.screen')) === 'matching', {
+      label: '页面一进入排队界面',
+    });
+    await p1.shot('13-net-queue');
+    await p2.click('.menu .remote-button');
+
+    await waitFor(async () => (await p1.evaluate('window.__tankApp.screen')) === 'select', {
+      label: '页面一匹配到对手',
+      timeout: 15000,
+    });
+    await waitFor(async () => (await p2.evaluate('window.__tankApp.screen')) === 'select', {
+      label: '页面二匹配到对手',
+      timeout: 15000,
+    });
+    const seat1 = await p1.evaluate('window.__tankApp.seat');
+    const seat2 = await p2.evaluate('window.__tankApp.seat');
+    check('两个页面被分到不同席位', seat1 !== seat2, `${seat1}/${seat2}`);
+    const seed1 = await p1.evaluate('window.__tankApp.remoteSeed');
+    const seed2 = await p2.evaluate('window.__tankApp.remoteSeed');
+    check('两端拿到同一个随机种子', typeof seed1 === 'number' && seed1 === seed2, `${seed1}/${seed2}`);
+
+    const leftPage = seat1 === 'left' ? p1 : p2;
+    const rightPage = seat1 === 'left' ? p2 : p1;
+    await leftPage.click('.panel-left .card[data-tank-id="hammer"]');
+    await rightPage.click('.panel-right .card[data-tank-id="scout"]');
+    await sleep(400);
+    const mirrored = await rightPage.evaluate(`window.__tankApp.select.getPicks().left`);
+    check('对手的选坦同步到另一端', mirrored === 'hammer', String(mirrored));
+    await leftPage.shot('14-net-select');
+
+    await leftPage.click('.next-button');
+    await rightPage.click('.next-button');
+    await waitFor(async () => (await leftPage.evaluate('window.__tankApp.screen')) === 'battle', {
+      label: '左端开局',
+      timeout: 15000,
+    });
+    await waitFor(async () => (await rightPage.evaluate('window.__tankApp.screen')) === 'battle', {
+      label: '右端开局',
+      timeout: 15000,
+    });
+    const n1 = await leftPage.evalFn(snapshot);
+    const n2 = await rightPage.evalFn(snapshot);
+    check(
+      '两端地形与出生点完全一致',
+      Math.abs(n1.left.x - n2.left.x) < 1e-6 && Math.abs(n1.right.x - n2.right.x) < 1e-6,
+      `${n1.left.x.toFixed(2)}/${n2.left.x.toFixed(2)}`,
+    );
+    check('两端坦克选择一致（重锤 140 / 游骑兵 80）', n2.left.hp === 140 && n1.right.hp === 80, `${n2.left.hp}/${n1.right.hp}`);
+    check('左方先手：左端可操作、右端被锁', n1.locked === false && n2.locked === true && n1.active === 'left',
+      `left.locked=${n1.locked} right.locked=${n2.locked}`);
+    const rightChip = await rightPage.evaluate(`document.querySelector('.hud-top .chip:nth-child(2)').textContent`);
+    check('被锁端提示等待对方操作', rightChip.includes('等待对方'), rightChip);
+    await leftPage.shot('15-net-battle-left');
+    await rightPage.shot('16-net-battle-right');
+
+    // 左端移动 → 右端实时回放
+    const mirroredXBefore = (await rightPage.evalFn(snapshot)).left.x;
+    await leftPage.click('.move-button.move-right');
+    await sleep(400);
+    await leftPage.evaluate(`window.__tankApp.turn.setMoveDirection(0)`);
+    await waitFor(async () => (await rightPage.evalFn(snapshot)).left.x > mirroredXBefore + 20, {
+      label: '右端回放左端的移动',
+      timeout: 10000,
+    });
+    check('右端回放左端的移动', true);
+
+    // 左端开火 → 右端复现同一发炮弹 → 回合结束自动换手
+    await leftPage.evalFn(AIMBOT);
+    await waitFor(async () => !!(await rightPage.evaluate('window.__tankApp.state?.projectile')), {
+      label: '右端复现左端的发射',
+      timeout: 10000,
+    });
+    check('右端复现左端的发射', true);
+    await waitFor(async () => (await rightPage.evaluate('window.__tankApp.state.activePlayerId')) === 'right', {
+      label: '右端轮换到右方回合',
+      timeout: 25000,
+    });
+    await waitFor(async () => (await leftPage.evaluate('window.__tankApp.state.activePlayerId')) === 'right', {
+      label: '左端也轮换到右方回合',
+      timeout: 25000,
+    });
+    const m1 = await leftPage.evalFn(snapshot);
+    const m2 = await rightPage.evalFn(snapshot);
+    check('轮转后两端锁定状态互换', m1.locked === true && m2.locked === false, `left=${m1.locked} right=${m2.locked}`);
+    check(
+      '回合校正让两端血量与位置一致',
+      Math.abs(m1.left.hp - m2.left.hp) < 0.001 && Math.abs(m1.left.x - m2.left.x) < 0.5,
+      `hp ${m1.left.hp}/${m2.left.hp} x ${m1.left.x.toFixed(1)}/${m2.left.x.toFixed(1)}`,
+    );
+    await rightPage.shot('17-net-battle-right-turn');
+
+    cdp.consoleErrors.push(...p1.consoleErrors, ...p2.consoleErrors);
+  } finally {
+    p1.close();
+    p2.close();
+  }
 }
 
 main().catch((error) => {

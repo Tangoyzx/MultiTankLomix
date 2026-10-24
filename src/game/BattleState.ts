@@ -23,6 +23,8 @@ export interface Floater {
 export class BattleState {
   readonly seed: number;
   readonly rng: Rng;
+  /** 特效专用随机流：与地形/风分开，避免两端特效消耗不同导致对局分叉。 */
+  readonly fxRng: Rng;
   readonly world: World;
   readonly tanks: Record<PlayerId, Tank>;
   activePlayerId: PlayerId = 'left';
@@ -34,6 +36,7 @@ export class BattleState {
   constructor(seed: number, picks: Record<PlayerId, string>) {
     this.seed = seed;
     this.rng = new Rng(seed);
+    this.fxRng = this.rng.fork(37);
     const terrain = generateTerrain(CONFIG, DERIVED, this.rng.fork(11));
     const wind = new Wind(CONFIG);
     wind.reset(this.rng.fork(23));

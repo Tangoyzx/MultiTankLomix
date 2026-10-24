@@ -15,6 +15,17 @@ import type { MoveDir } from './MoveController.js';
 
 export type TurnPhase = 'turnStart' | 'move' | 'aim' | 'resolving' | 'impact' | 'gameOver';
 
+/** 远端对局里每回合结束发给对手的权威摘要，用来兜住浮点累积造成的漂移。 */
+export interface TurnSnapshot {
+  playerId: PlayerId;
+  hp: number;
+  x: number;
+  y: number;
+  /** 车体贴合地形后的倾角（弧度），远端校正后画面不会歪。 */
+  rotation: number;
+  windLevel: number;
+}
+
 export type TurnEvents = {
   turnStart: { playerId: PlayerId; wind: number };
   phase: { phase: TurnPhase; playerId: PlayerId };
@@ -24,6 +35,7 @@ export type TurnEvents = {
   shot: { playerId: PlayerId; angleDeg: number; power: number; dirSign: 1 | -1; origin: Vec2 };
   impact: { hit: Hit; results: DamageResult[] };
   moveCommitted: { playerId: PlayerId; dir: -1 | 1; distance: number };
+  turnEnd: TurnSnapshot;
   gameOver: { winner: PlayerId };
 };
 
@@ -92,6 +104,35 @@ export class TurnController {
     this.setPhase('move');
     this.events.emit('turnStart', { playerId, wind: this.state.world.wind.level });
     this.events.emit('cameraFocus', { playerId });
+  }
+
+  /** 回合切换时把上一回合的权威状态交给上层，远端会发给对手做校正。 */
+  private snapshotOf(playerId: PlayerId): TurnSnapshot {
+    const tank = this.state.tanks[playerId];
+    return {
+      playerId,
+      hp: tank.hp,
+      x: tank.x,
+      y: tank.y,
+      rotation: tank.rotation,
+      windLevel: this.state.world.wind.level,
+    };
+  }
+
+  /** 远端校正：只改非本方（当前不操作）的坦克与风向，不打断本方动画。 */
+  applySync(snapshot: TurnSnapshot): void {
+    if (!snapshot || this.state.activePlayerId === snapshot.playerId) return;
+    const tank = this.state.tanks[snapshot.playerId];
+    if (!tank) return;
+    if (Number.isFinite(snapshot.hp)) tank.hp = snapshot.hp;
+    if (Number.isFinite(snapshot.x) && Number.isFinite(snapshot.y)) {
+      tank.x = snapshot.x;
+      tank.y = snapshot.y;
+      tank.syncToGround(this.state.world.terrain);
+      tank.rotation = snapshot.rotation;
+    }
+    if (Number.isFinite(snapshot.rotation)) tank.rotation = snapshot.rotation;
+    if (Number.isFinite(snapshot.windLevel)) this.state.world.wind.level = snapshot.windLevel;
   }
 
   setMoveDirection(dir: MoveDir): void {
@@ -198,7 +239,10 @@ export class TurnController {
     if (this.phase === 'impact') {
       this.impactTimer -= dt;
       if (this.impactTimer <= 0 && state.explosions.length === 0) {
-        this.beginTurn(otherPlayer(state.activePlayerId));
+        const previous = state.activePlayerId;
+        // 先把这一回合的权威结果发出去，再换人：远端拿到后校正对手侧的血量/位置。
+        this.events.emit('turnEnd', this.snapshotOf(previous));
+        this.beginTurn(otherPlayer(previous));
       }
     }
   }
@@ -222,7 +266,7 @@ export class TurnController {
     const results = resolveDamage(hit, this.state.tanks, CONFIG);
     if (hit.kind !== 'out') {
       this.state.explosions.push(
-        new Explosion(hit.point.x, hit.point.y, CONFIG, () => this.state.rng.next()),
+        new Explosion(hit.point.x, hit.point.y, CONFIG, () => this.state.fxRng.next()),
       );
     }
     for (const result of results) {

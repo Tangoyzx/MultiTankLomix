@@ -137,6 +137,7 @@ class El {
     this.clientHeight = 64;
     this._text = '';
     this._listeners = new Map();
+    this.attributes = new Map();
     this.classList = makeClassList(this);
   }
 
@@ -181,6 +182,19 @@ class El {
     const list = this._listeners.get(type) ?? [];
     list.push(fn);
     this._listeners.set(type, list);
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(String(name), String(value));
+  }
+
+  getAttribute(name) {
+    const value = this.attributes.get(String(name));
+    return value === undefined ? null : value;
+  }
+
+  removeAttribute(name) {
+    this.attributes.delete(String(name));
   }
 
   removeEventListener(type, fn) {
@@ -249,15 +263,101 @@ const documentShim = {
   getElementById(id) {
     return documentShim._byId.get(id) ?? null;
   },
+  /** 只支持 `meta[name="app-version"]` 这类简单选择器，够界面读版本号用。 */
+  querySelector(selector) {
+    return documentShim._bySelector.get(selector) ?? null;
+  },
+  querySelectorAll(selector) {
+    const found = documentShim._bySelector.get(selector);
+    return found ? [found] : [];
+  },
   _byId: new Map(),
+  _bySelector: new Map(),
 };
+
+/** 同浏览器联调用的最小 BroadcastChannel：同名的频道之间异步转发消息。 */
+class BroadcastChannelShim {
+  static channels = new Map();
+
+  constructor(name) {
+    this.name = name;
+    this.onmessage = null;
+    this.closed = false;
+    const peers = BroadcastChannelShim.channels.get(name) ?? [];
+    peers.push(this);
+    BroadcastChannelShim.channels.set(name, peers);
+  }
+
+  postMessage(data) {
+    if (this.closed) return;
+    const peers = BroadcastChannelShim.channels.get(this.name) ?? [];
+    for (const peer of peers) {
+      if (peer === this || peer.closed) continue;
+      setTimeout(() => {
+        if (!peer.closed) peer.onmessage?.({ data });
+      }, 0);
+    }
+  }
+
+  close() {
+    this.closed = true;
+    const peers = BroadcastChannelShim.channels.get(this.name) ?? [];
+    const index = peers.indexOf(this);
+    if (index >= 0) peers.splice(index, 1);
+  }
+}
+globalThis.BroadcastChannel = BroadcastChannelShim;
+
+/**
+ * 远端传输用的 WebSocket 桩：只记录发出去的报文，永不真的联网。
+ * 这样界面层能验证“点了远端对战就发 handshake + join 去排队”。
+ */
+class WebSocketShim {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+
+  constructor(url) {
+    this.url = url;
+    this.readyState = WebSocketShim.CONNECTING;
+    this.sent = [];
+    WebSocketShim.instances.push(this);
+    setTimeout(() => {
+      if (this.readyState !== WebSocketShim.CONNECTING) return;
+      this.readyState = WebSocketShim.OPEN;
+      this.onopen?.();
+    }, 0);
+  }
+
+  send(data) {
+    this.sent.push(data);
+  }
+
+  close() {
+    if (this.readyState === WebSocketShim.CLOSED) return;
+    this.readyState = WebSocketShim.CLOSED;
+    this.onclose?.();
+  }
+
+  messages() {
+    return this.sent.map((raw) => JSON.parse(raw));
+  }
+}
+WebSocketShim.instances = [];
+globalThis.WebSocket = WebSocketShim;
 
 const windowShim = {
   listeners: new Map(),
   innerWidth: VIEW.width,
   innerHeight: VIEW.height,
   devicePixelRatio: 2,
-  location: { search: '' },
+  location: {
+    search: '',
+    reload() {
+      windowShim.reloaded = (windowShim.reloaded ?? 0) + 1;
+    },
+  },
   setTimeout: (fn, ms) => setTimeout(fn, ms),
   clearTimeout: (id) => clearTimeout(id),
   addEventListener(type, fn) {
@@ -350,7 +450,7 @@ let local = null;
 /** 最近一次按下坦克时的屏幕坐标，用于验证镜头拉远后拖拽原点会跟着坦克走。 */
 let lastPressScreen = null;
 
-await test('本地双人可点，远端多人按钮置灰', () => {
+await test('本地双人与远端对战两个入口都可点', () => {
   local = bootApp(DETERMINISTIC_URL);
   const { app, uiRoot } = local;
   assert.equal(app.screen, 'menu');
@@ -358,21 +458,99 @@ await test('本地双人可点，远端多人按钮置灰', () => {
   assert.ok(menu && !menu.classList.contains('hidden'), '主界面应可见');
 
   const localBtn = menuButton(uiRoot, '本地双人游玩');
-  const remoteBtn = menuButton(uiRoot, '远端多人游玩');
+  const remoteBtn = menuButton(uiRoot, '远端对战（快速匹配）');
   assert.ok(localBtn, '找不到本地双人按钮');
-  assert.ok(remoteBtn, '找不到远端多人按钮');
-  assert.equal(remoteBtn.disabled, true, '远端按钮必须置灰');
-  assert.ok(remoteBtn.classList.contains('disabled-button'));
+  assert.ok(remoteBtn, '找不到远端对战按钮');
+  assert.notEqual(localBtn.disabled, true, '本地双人按钮应可点');
+  assert.notEqual(remoteBtn.disabled, true, '远端对战按钮应可点（远端已开放）');
+  assert.ok(remoteBtn.classList.contains('remote-button'), '远端按钮应有独立样式');
   assert.equal(app.state, null, '主界面不应存在对局');
   pump(3);
 });
 
-await test('点远端按钮只提示“即将开放”，不进入对局', () => {
+await test('点远端对战进入排队界面，连上就发 handshake + join', async () => {
   const { app, uiRoot } = local;
-  const remoteBtn = menuButton(uiRoot, '远端多人游玩');
-  remoteBtn.parent?.dispatch('click');
-  assert.equal(app.screen, 'menu');
-  assert.ok(findByClass(uiRoot, 'toast').length > 0, '应出现提示条');
+  click(menuButton(uiRoot, '远端对战（快速匹配）'));
+  assert.equal(app.screen, 'matching', '应进入快速匹配等待界面');
+  assert.equal(app.mode, 'remote');
+  const matchScreen = findByClass(uiRoot, 'match-screen')[0];
+  assert.ok(matchScreen && !matchScreen.classList.contains('hidden'), '匹配界面应可见');
+  assert.ok(findByClass(uiRoot, 'menu')[0].classList.contains('hidden'), '主界面应隐藏');
+  assert.match(matchScreen.textContent, /版本/, '匹配界面应显示版本号方便排查');
+
+  await tick();
+  const socket = app.transport.socket;
+  assert.ok(socket, '应已建立 WebSocket');
+  const sent = socket.messages();
+  assert.equal(sent[0]?.type, 'handshake', '连上后第一条应是握手');
+  assert.ok(sent[0]?.configHash, '握手要带玩法配置哈希');
+  assert.equal(sent[1]?.type, 'join', '握手后应立刻请求加入快速匹配队列');
+  assert.match(
+    findByClass(uiRoot, 'match-status')[0].textContent,
+    /已连接|等待/,
+    '连上后应提示正在等待对手',
+  );
+});
+
+await test('收到排队/配对通知后界面跟着走，取消可回主界面', async () => {
+  const { app, uiRoot } = local;
+  app.transport.events.emit('command', { type: 'queued', reason: 'waiting' });
+  assert.match(findByClass(uiRoot, 'match-status')[0].textContent, /排队中/);
+
+  app.transport.events.emit('command', { type: 'matched', roomId: 'room-1', seed: 20251022, seat: 'right' });
+  assert.equal(app.screen, 'select', '配对成功应进入选坦');
+  assert.equal(app.seat, 'right', '席位以服务端下发为准');
+  assert.equal(app.remoteSeed, 20251022, '种子以服务端下发为准');
+
+  click(menuButton(uiRoot, '返回'));
+  assert.equal(app.screen, 'menu', '选坦返回应回到主界面');
+  assert.equal(app.transport, null, '回主界面应断开远端连接');
+});
+
+await test('服务端换了构建就提示刷新，点一下真的刷新', async () => {
+  documentShim._bySelector.set('meta[name="app-version"]', { getAttribute: () => '0.1.0' });
+  documentShim._bySelector.set('meta[name="app-build"]', { getAttribute: () => 'localbuild' });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({ version: '0.2.0', gitCommit: 'abc1234', build: 'serverbuild' }),
+  });
+  windowShim.reloaded = 0;
+
+  try {
+    const { app, uiRoot } = bootApp(DETERMINISTIC_URL);
+    await tick(10);
+    const banner = findByClass(uiRoot, 'update-banner')[0];
+    assert.ok(banner, '服务端构建指纹不同时应弹出更新提示');
+    assert.match(banner.textContent, /发现新版本/);
+    banner.dispatch('click');
+    assert.equal(windowShim.reloaded, 1, '点提示应刷新页面拿最新资源');
+    assert.equal(app.screen, 'menu', '提示不应打断当前流程');
+  } finally {
+    globalThis.fetch = originalFetch;
+    documentShim._bySelector.delete('meta[name="app-version"]');
+    documentShim._bySelector.delete('meta[name="app-build"]');
+  }
+});
+
+await test('版本一致时不打扰玩家', async () => {
+  documentShim._bySelector.set('meta[name="app-version"]', { getAttribute: () => '0.2.0' });
+  documentShim._bySelector.set('meta[name="app-build"]', { getAttribute: () => 'samebuild' });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({ version: '0.2.0', gitCommit: 'abc1234', build: 'samebuild' }),
+  });
+
+  try {
+    const { uiRoot } = bootApp(DETERMINISTIC_URL);
+    await tick(10);
+    assert.equal(findByClass(uiRoot, 'update-banner').length, 0, '版本一致不该弹提示');
+  } finally {
+    globalThis.fetch = originalFetch;
+    documentShim._bySelector.delete('meta[name="app-version"]');
+    documentShim._bySelector.delete('meta[name="app-build"]');
+  }
 });
 
 section('选坦界面');
@@ -649,15 +827,17 @@ await test('自己回合本地操作，对方回合锁输入并按命令回放',
   assert.equal(b.app.mode, 'remote');
   assert.equal(b.app.seat, 'right');
 
-  windowShim.location.search = a.app.mode === 'remote' ? '?mode=remote&seat=left&net=broadcast&room=domtest' : '';
-  click(menuButton(a.uiRoot, '本地双人游玩'));
+  // 两个标签页都点“远端对战（快速匹配）”；URL 带 net=broadcast 时走同浏览器对联通道，
+  // 跳过服务器匹配，其余流程与真实远端完全一致。
+  windowShim.location.search = '?mode=remote&seat=left&net=broadcast&room=domtest';
+  click(menuButton(a.uiRoot, '远端对战（快速匹配）'));
   windowShim.location.search = '?mode=remote&seat=right&net=broadcast&room=domtest';
-  click(menuButton(b.uiRoot, '本地双人游玩'));
+  click(menuButton(b.uiRoot, '远端对战（快速匹配）'));
   assert.equal(a.app.screen, 'select');
   assert.equal(b.app.screen, 'select');
   await tick();
 
-  // A 选左席（自己），B 的右席由自己选；A 点下一步开始对局并广播种子与选择
+  // A 选左席（自己），B 的右席由自己选；选择通过通道同步
   const pickCard = (root, panel, tankId) =>
     findByClass(root, panel)[0].querySelectorAll(`.card[data-tank-id="${tankId}"]`)[0];
   click(pickCard(a.uiRoot, 'panel-left', 'hammer'));
@@ -665,8 +845,32 @@ await test('自己回合本地操作，对方回合锁输入并按命令回放',
   await tick();
   assert.equal(b.app.select.getPicks().left, 'hammer', '对方的选择应同步到本地');
 
+  // 两端都点下一步只上报“已就绪”，开局要等服务端的 start（这条通道里由本用例代发）
+  const sentBy = new Map();
+  for (const side of [a, b]) {
+    const original = side.app.transport.send.bind(side.app.transport);
+    const log = [];
+    sentBy.set(side, log);
+    side.app.transport.send = (command) => {
+      log.push(command);
+      original(command);
+    };
+  }
   windowShim.location.search = '?mode=remote&seat=left&net=broadcast&room=domtest';
   click(findByClass(a.uiRoot, 'next-button')[0]);
+  windowShim.location.search = '?mode=remote&seat=right&net=broadcast&room=domtest';
+  click(findByClass(b.uiRoot, 'next-button')[0]);
+  await tick(20);
+  assert.equal(a.app.screen, 'select', '只就绪不应自己开局');
+  assert.ok(sentBy.get(a).some((m) => m.type === 'ready'), 'A 应上报就绪');
+  assert.ok(sentBy.get(b).some((m) => m.type === 'ready'), 'B 应上报就绪');
+  for (const side of [a, b]) {
+    side.app.transport.events.emit('command', {
+      type: 'start',
+      seed: 20251022,
+      picks: { left: 'hammer', right: 'scout' },
+    });
+  }
   await tick(20);
 
   assert.equal(a.app.screen, 'battle');

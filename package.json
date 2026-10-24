@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "build": "node tools/build.mjs",
+    "start": "node tools/serve.mjs",
     "serve": "node tools/serve.mjs dist",
+    "match": "node server/start-match.mjs",
     "pack": "node tools/build.mjs && node tools/pack-dist.mjs",
-    "test": "node tools/build.mjs && node tools/logictest.mjs && node tools/domtest.mjs",
+    "test": "node tools/build.mjs && node tools/logictest.mjs && node tools/domtest.mjs && node tools/nettest.mjs",
+    "test:net": "node tools/nettest.mjs",
     "dev": "vite --host",
     "typecheck": "tsc --noEmit"
   },

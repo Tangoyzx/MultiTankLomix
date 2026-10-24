@@ -15,6 +15,10 @@ REPO=""
 BRANCH="main"
 NO_FIREWALL=0
 ROLLBACK=0
+MATCH_INSTALLED=0
+# 远端对战的对局服务（WebSocket）端口：nginx 反代 /ws 到它，只有本机可连
+WSPORT="8787"
+APP_DIR="/opt/multitank"
 
 log()  { printf '[deploy] %s\n' "$*"; }
 warn() { printf '[warn]   %s\n' "$*" >&2; }
@@ -29,7 +33,9 @@ usage() {
                       build 服务器 git clone 源码后 node tools/build.mjs（需 Node >= 22.13）
                       serve 不装 nginx，用 node tools/serve.mjs + systemd 常驻（需 Node >= 18）
   --port  N           监听端口，默认 8080
+  --wsport N          对局服务（WebSocket）端口，默认 8787；serve 模式与网页同端口
   --docroot PATH      站点根目录，默认 /var/www/multitank
+  --appdir PATH       对局服务安装目录，默认 /opt/multitank
   --tarball PATH      dist 模式的 tar.gz（默认自动找 multitank-dist.tar.gz）
   --srcdir  PATH      已上传目录：dist 模式当成品目录，build/serve 模式当源码目录
   --repo   URL        build/serve 模式 git clone 的地址
@@ -43,7 +49,9 @@ HELP
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port)        PORT="${2:?--port 需要值}"; shift 2 ;;
+    --wsport)      WSPORT="${2:?--wsport 需要值}"; shift 2 ;;
     --docroot)     DOCROOT="${2:?--docroot 需要值}"; shift 2 ;;
+    --appdir)      APP_DIR="${2:?--appdir 需要值}"; shift 2 ;;
     --mode)        MODE="${2:?--mode 需要值}"; shift 2 ;;
     --tarball)     TARBALL="${2:?--tarball 需要值}"; shift 2 ;;
     --srcdir)      SRCDIR="${2:?--srcdir 需要值}"; shift 2 ;;
@@ -214,9 +222,9 @@ write_nginx_conf() {
   local tpl="$SCRIPT_DIR/nginx-multitank.conf"
   [[ -f "$tpl" ]] || die "缺少模板文件: $tpl"
   $SUDO mkdir -p /etc/nginx/conf.d
-  sed -e "s|__PORT__|${PORT}|g" -e "s|__DOCROOT__|${DOCROOT}|g" "$tpl" \
+  sed -e "s|__PORT__|${PORT}|g" -e "s|__DOCROOT__|${DOCROOT}|g" -e "s|__WSPORT__|${WSPORT}|g" "$tpl" \
     | $SUDO tee /etc/nginx/conf.d/multitank.conf >/dev/null
-  log "写入 /etc/nginx/conf.d/multitank.conf（端口 $PORT，根目录 $DOCROOT）"
+  log "写入 /etc/nginx/conf.d/multitank.conf（端口 $PORT，根目录 $DOCROOT，对局服务 $WSPORT）"
   $SUDO nginx -t || die "nginx 配置校验失败，站点未受影响，请按上面报错修掉后重跑"
 }
 
@@ -275,6 +283,41 @@ open_firewall() {
   fi
 }
 
+# 远端对战需要的对局服务：把 server/ 装到 APP_DIR，用 systemd 常驻，
+# nginx 把 /ws 反代过来；serve 模式不需要它（网页与 ws 本来就同端口）。
+install_match_service() {
+  local src="$STAGE/server"
+  if [[ ! -f "$src/start-match.mjs" ]]; then
+    warn "成品里没有 server/start-match.mjs，跳过对局服务：远端对战不可用"
+    warn "远端对战请改用 --mode serve（tools/serve.mjs 同时提供网页与 WebSocket）"
+    return
+  fi
+  check_node_basic
+  local node_bin; node_bin="$(command -v node)"
+  $SUDO mkdir -p "$APP_DIR"
+  $SUDO rm -rf "$APP_DIR/server"
+  $SUDO cp -a "$src" "$APP_DIR/server"
+  $SUDO tee /etc/systemd/system/multitank-match.service >/dev/null <<UNIT
+[Unit]
+Description=MultiTankLomix match server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+ExecStart=${node_bin} ${APP_DIR}/server/start-match.mjs --port ${WSPORT} --path /ws --root ${DOCROOT}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable --now multitank-match
+  MATCH_INSTALLED=1
+  log "对局服务已启动：ws://127.0.0.1:${WSPORT}/ws"
+}
+
 verify() {
   have_cmd curl || die "缺少 curl，无法自检"
   local base="http://127.0.0.1:${PORT}"
@@ -285,6 +328,20 @@ verify() {
   code="$(curl -s -o /dev/null -w '%{http_code}' "$base/main.js" || true)"
   [[ "$code" == "200" ]] || die "静态资源 main.js 返回 ${code:-无响应}"
   log "自检通过：/ 与 /main.js 均为 200"
+
+  # 版本清单：客户端拿它判断要不要刷新，必须能取到而且是 no-store
+  code="$(curl -s -o /tmp/multitank-version.json -w '%{http_code}' "$base/version.json" || true)"
+  [[ "$code" == "200" ]] || die "/version.json 返回 ${code:-无响应}"
+  grep -q '"build"' /tmp/multitank-version.json || die "/version.json 里没有 build 指纹"
+
+  if [[ "$MATCH_INSTALLED" == "1" ]]; then
+    code="$(curl -s -o /dev/null -w '%{http_code}' \
+      -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+      -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+      "$base/ws" || true)"
+    [[ "$code" == "101" ]] || die "/ws 握手返回 ${code:-无响应}（期望 101），远端对战不可用"
+    log "自检通过：/version.json 与 /ws 握手（101）"
+  fi
 }
 
 summary() {
@@ -296,6 +353,7 @@ summary() {
 模式      : ${MODE}
 站点目录  : ${DOCROOT}
 端口      : ${PORT}
+远端对战  : $([[ "$MATCH_INSTALLED" == "1" ]] && echo "ws://127.0.0.1:${WSPORT}/ws（nginx /ws 已反代）" || echo "未启用（用 --mode serve 或让成品带上 server/）")
 本机自检  : http://127.0.0.1:${PORT}
 内网地址  : http://${ip:-内网IP}:${PORT}
 外网访问  : http://公网IP:${PORT}   （记得在腾讯云轻量防火墙放行 TCP ${PORT}）
@@ -317,8 +375,12 @@ main() {
   if [[ "$MODE" == "serve" ]]; then
     check_node_basic
     write_systemd_unit
+    # serve 模式网页与 WebSocket 同端口，握手自检直接打站点端口
+    MATCH_INSTALLED=1
+    WSPORT="$PORT"
   else
     install_nginx
+    install_match_service
     write_nginx_conf
     reload_nginx
   fi
